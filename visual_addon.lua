@@ -372,15 +372,123 @@ local function ensureModel(instance, name)
 	return nil
 end
 
-local function buildRenderModel(itemKey)
-	local weaponData = Sync.Weapons and Sync.Weapons[itemKey]
-	if type(weaponData) ~= "table" then
+local function cloneToolAsModel(tool, name)
+	if not tool or not tool:IsA("Tool") then
 		return nil
+	end
+
+	local model = Instance.new("Model")
+	model.Name = name
+
+	for _, child in ipairs(tool:GetChildren()) do
+		if not child:IsA("Script") and not child:IsA("LocalScript") and not child:IsA("ModuleScript") then
+			local ok, clone = pcall(function()
+				return child:Clone()
+			end)
+			if ok and clone then
+				clone.Parent = model
+			end
+		end
+	end
+
+	if not model:FindFirstChildWhichIsA("BasePart", true) then
+		model:Destroy()
+		return nil
+	end
+
+	return model
+end
+
+local function collectFallbackRoots()
+	local roots = {
+		localPlayer.Character,
+		localPlayer:FindFirstChildOfClass("Backpack"),
+		localPlayer:FindFirstChild("StarterGear"),
+		game:GetService("ReplicatedStorage"),
+		workspace,
+	}
+
+	local deduped = {}
+	local seen = {}
+	for _, root in ipairs(roots) do
+		if root and not seen[root] then
+			seen[root] = true
+			table.insert(deduped, root)
+		end
+	end
+
+	return deduped
+end
+
+local function findFallbackInstance(entry)
+	if not entry then
+		return nil
+	end
+
+	local targetNames = {
+		[normalizeName(entry.key)] = true,
+		[normalizeName(entry.name)] = true,
+	}
+
+	for _, root in ipairs(collectFallbackRoots()) do
+		local ok, descendants = pcall(function()
+			return root:GetDescendants()
+		end)
+		if ok and descendants then
+			for _, desc in ipairs(descendants) do
+				local matches = targetNames[normalizeName(desc.Name)] == true
+				if matches then
+					if desc:IsA("Tool") then
+						return desc
+					end
+					if desc:IsA("Model") and desc:FindFirstChildWhichIsA("BasePart", true) then
+						return desc
+					end
+					if desc:IsA("BasePart") then
+						return desc
+					end
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+local function buildFallbackModel(entry)
+	local found = findFallbackInstance(entry)
+	if not found then
+		return nil
+	end
+
+	if found:IsA("Tool") then
+		return cloneToolAsModel(found, "__MM2VisualWeapon_" .. entry.key)
+	end
+
+	local ok, clone = pcall(function()
+		return found:Clone()
+	end)
+	if not ok or not clone then
+		return nil
+	end
+
+	local built = ensureModel(clone, "__MM2VisualWeapon_" .. entry.key)
+	if built then
+		built.Archivable = true
+	end
+	return built
+end
+
+local function buildRenderModel(entry)
+	local itemKey = entry and entry.key
+	local weaponData = itemKey and Sync.Weapons and Sync.Weapons[itemKey]
+	if type(weaponData) ~= "table" then
+		return buildFallbackModel(entry)
 	end
 
 	local frame = createDisplayFrame()
 	if not frame then
-		return nil
+		return buildFallbackModel(entry)
 	end
 
 	local payload = {}
@@ -396,7 +504,7 @@ local function buildRenderModel(itemKey)
 
 	if not ok then
 		frame:Destroy()
-		return nil
+		return buildFallbackModel(entry)
 	end
 
 	RunService.Heartbeat:Wait()
@@ -408,12 +516,18 @@ local function buildRenderModel(itemKey)
 
 	if built then
 		built.Archivable = true
+		return built
 	end
 
-	return built
+	return buildFallbackModel(entry)
 end
 
-local function getRenderModel(itemKey)
+local function getRenderModel(entry)
+	local itemKey = entry and entry.key
+	if not itemKey then
+		return nil
+	end
+
 	local cached = state.renderCacheByKey[itemKey]
 	if cached then
 		return cached
@@ -424,7 +538,7 @@ local function getRenderModel(itemKey)
 		return nil
 	end
 
-	local built = buildRenderModel(itemKey)
+	local built = buildRenderModel(entry)
 	if built then
 		state.renderCacheByKey[itemKey] = built
 		state.renderMissAtByKey[itemKey] = nil
@@ -511,7 +625,7 @@ local function clearVisualForType(weaponType)
 end
 
 local function attachWeapon(character, weaponType, entry)
-	local sourceModel = getRenderModel(entry.key)
+	local sourceModel = getRenderModel(entry)
 	if not sourceModel then
 		return false, "render model not found"
 	end
