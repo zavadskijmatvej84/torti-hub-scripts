@@ -22,6 +22,7 @@ local state = {
 	running = true,
 	currentCharacter = nil,
 	activeByType = {},
+	lastResolvedByType = {},
 	renderCacheByKey = {},
 	renderMissAtByKey = {},
 	screenGui = nil,
@@ -616,6 +617,37 @@ local function getOffset(anchorPart, weaponType)
 	return isHand and attachOffsets.GunHand or attachOffsets.GunTorso
 end
 
+local genericToolNamesByType = {
+	Knife = {
+		[normalizeName("Knife")] = true,
+	},
+	Gun = {
+		[normalizeName("Gun")] = true,
+		[normalizeName("Revolver")] = true,
+	},
+}
+
+local function hasRuntimeToolOfType(character, weaponType)
+	if not character then
+		return false
+	end
+
+	local knownGenericNames = genericToolNamesByType[weaponType] or {}
+	for _, desc in ipairs(character:GetDescendants()) do
+		if desc:IsA("Tool") then
+			local resolved = resolveWeapon(desc.Name)
+			if resolved and resolved.type == weaponType then
+				return true
+			end
+			if knownGenericNames[normalizeName(desc.Name)] then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
 local function clearVisualForType(weaponType)
 	local current = state.activeByType[weaponType]
 	if current and current.model then
@@ -686,12 +718,33 @@ local function refresh()
 
 	for _, weaponType in ipairs({ "Knife", "Gun" }) do
 		local candidate = equipped[weaponType]
+		if candidate and candidate.entry then
+			state.lastResolvedByType[weaponType] = candidate.entry
+		end
+
 		local desiredKey = candidate and candidate.entry and candidate.entry.key or nil
 		local active = state.activeByType[weaponType]
+		local rememberedEntry = state.lastResolvedByType[weaponType]
+		local hasRuntimeTool = hasRuntimeToolOfType(character, weaponType)
 
 		if not desiredKey then
-			clearVisualForType(weaponType)
-			table.insert(statusParts, weaponType .. ": none")
+			if active and active.model and active.model.Parent == character and hasRuntimeTool then
+				local keptName = rememberedEntry and rememberedEntry.name or active.key
+				table.insert(statusParts, weaponType .. ": " .. tostring(keptName) .. " (kept)")
+			elseif rememberedEntry and hasRuntimeTool then
+				clearVisualForType(weaponType)
+				local ok, err = attachWeapon(character, weaponType, rememberedEntry)
+				if ok then
+					table.insert(statusParts, weaponType .. ": " .. tostring(rememberedEntry.name) .. " (restored)")
+				else
+					table.insert(statusParts, weaponType .. ": failed")
+					statusColor = Color3.fromRGB(255, 170, 120)
+					firstError = firstError or (weaponType .. " restore error: " .. tostring(err))
+				end
+			else
+				clearVisualForType(weaponType)
+				table.insert(statusParts, weaponType .. ": none")
+			end
 		else
 			local needsRebuild = (not active)
 				or active.key ~= desiredKey
