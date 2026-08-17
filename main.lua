@@ -254,11 +254,390 @@ do
 end
 
 -- === Basic item checks ===
+local InventoryOverlayTypes = {
+	Weapons = true,
+	Pets = true,
+}
+
+local InventoryOverlayState = {
+	baseByType = {},
+	deltaByType = {},
+	shadowByType = {},
+}
+
+local function NormalizeOwnedAmount(value)
+	local numeric = tonumber(value)
+	if numeric then
+		return math.max(0, math.floor(numeric + 0.00001))
+	end
+	if value == nil then
+		return 0
+	end
+	return 1
+end
+
+local function CopyOwnedCounts(source)
+	local copy = {}
+	if type(source) ~= "table" then
+		return copy
+	end
+	for key, value in pairs(source) do
+		if type(key) == "string" then
+			local amount = NormalizeOwnedAmount(value)
+			if amount > 0 then
+				copy[key] = amount
+			end
+		end
+	end
+	return copy
+end
+
+local function GetOwnedBucket(itemType)
+	if not ProfileData[itemType] then
+		ProfileData[itemType] = {}
+	end
+	if type(ProfileData[itemType].Owned) ~= "table" then
+		ProfileData[itemType].Owned = {}
+	end
+	return ProfileData[itemType].Owned
+end
+
+local function AnalyzeOwnedCounts(itemType)
+	local stringCounts = {}
+	local listCounts = {}
+	local owned = ProfileData[itemType] and ProfileData[itemType].Owned
+	if type(owned) ~= "table" then
+		return stringCounts, listCounts
+	end
+
+	for key, value in pairs(owned) do
+		if type(key) == "string" then
+			local amount = NormalizeOwnedAmount(value)
+			if amount > 0 then
+				stringCounts[key] = (stringCounts[key] or 0) + amount
+			end
+		elseif type(value) == "string" and value ~= "" then
+			listCounts[value] = (listCounts[value] or 0) + 1
+		elseif type(value) == "table" then
+			local itemName = value.Name or value.ItemName or value.Key or value.Id
+			if type(itemName) == "string" and itemName ~= "" then
+				local amount = NormalizeOwnedAmount(value.Amount or value.Count or value.Quantity or 1)
+				if amount > 0 then
+					listCounts[itemName] = (listCounts[itemName] or 0) + amount
+				end
+			end
+		end
+	end
+
+	return stringCounts, listCounts
+end
+
+local function BuildBaseSnapshot(itemType)
+	local base = {}
+	local stringCounts, listCounts = AnalyzeOwnedCounts(itemType)
+
+	for itemName, amount in pairs(stringCounts) do
+		base[itemName] = {
+			stringAmount = amount,
+			listAmount = listCounts[itemName] or 0,
+		}
+	end
+
+	for itemName, amount in pairs(listCounts) do
+		if not base[itemName] then
+			base[itemName] = {
+				stringAmount = 0,
+				listAmount = amount,
+			}
+		end
+	end
+
+	return base
+end
+
+local function GetOverlayBase(itemType)
+	if not InventoryOverlayState.baseByType[itemType] then
+		InventoryOverlayState.baseByType[itemType] = BuildBaseSnapshot(itemType)
+	end
+	return InventoryOverlayState.baseByType[itemType]
+end
+
+local function GetOverlayDelta(itemType)
+	if not InventoryOverlayState.deltaByType[itemType] then
+		InventoryOverlayState.deltaByType[itemType] = {}
+	end
+	return InventoryOverlayState.deltaByType[itemType]
+end
+
+local function GetOverlayShadow(itemType)
+	if not InventoryOverlayState.shadowByType[itemType] then
+		InventoryOverlayState.shadowByType[itemType] = {}
+	end
+	return InventoryOverlayState.shadowByType[itemType]
+end
+
+local function FireInventoryDataChanged()
+	pcall(function()
+		game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
+	end)
+end
+
+local function GetBaseEntryAmounts(itemType, itemName)
+	local entry = GetOverlayBase(itemType)[itemName]
+	if not entry then
+		return 0, 0
+	end
+	return entry.stringAmount or 0, entry.listAmount or 0
+end
+
+local function GetVisibleAmountFromParts(baseStringAmount, baseListAmount, deltaAmount)
+	return baseListAmount + math.max(0, baseStringAmount + (deltaAmount or 0))
+end
+
+local function BuildOverlayVisibleCounts(itemType)
+	local visible = {}
+	local seen = {}
+	local base = GetOverlayBase(itemType)
+	local delta = GetOverlayDelta(itemType)
+
+	local function visit(itemName)
+		if seen[itemName] then
+			return
+		end
+		seen[itemName] = true
+
+		local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
+		local visibleAmount = GetVisibleAmountFromParts(baseStringAmount, baseListAmount, delta[itemName] or 0)
+		if visibleAmount > 0 then
+			visible[itemName] = visibleAmount
+		end
+	end
+
+	for itemName in pairs(base) do
+		visit(itemName)
+	end
+	for itemName in pairs(delta) do
+		visit(itemName)
+	end
+
+	return visible
+end
+
+local function ApplyOverlayForType(itemType)
+	if not InventoryOverlayTypes[itemType] then
+		return
+	end
+
+	local owned = GetOwnedBucket(itemType)
+	local base = GetOverlayBase(itemType)
+	local delta = GetOverlayDelta(itemType)
+	local previousShadow = GetOverlayShadow(itemType)
+	local nextShadow = {}
+	local seen = {}
+
+	local function visit(itemName)
+		if seen[itemName] then
+			return
+		end
+		seen[itemName] = true
+
+		local baseStringAmount = 0
+		local entry = base[itemName]
+		if entry then
+			baseStringAmount = entry.stringAmount or 0
+		end
+
+		local targetStringAmount = math.max(0, baseStringAmount + (delta[itemName] or 0))
+		if targetStringAmount > 0 then
+			owned[itemName] = targetStringAmount
+			nextShadow[itemName] = targetStringAmount
+		else
+			owned[itemName] = nil
+		end
+	end
+
+	for itemName in pairs(base) do
+		visit(itemName)
+	end
+	for itemName in pairs(delta) do
+		visit(itemName)
+	end
+	for itemName in pairs(previousShadow) do
+		visit(itemName)
+	end
+
+	InventoryOverlayState.shadowByType[itemType] = nextShadow
+end
+
+local function ApplyOverlayForAllTypes(shouldFire)
+	for itemType in pairs(InventoryOverlayTypes) do
+		ApplyOverlayForType(itemType)
+	end
+	if shouldFire then
+		FireInventoryDataChanged()
+	end
+end
+
+local function SyncOverlayBaseForType(itemType)
+	if not InventoryOverlayTypes[itemType] then
+		return false
+	end
+
+	local currentString, currentList = AnalyzeOwnedCounts(itemType)
+	local base = GetOverlayBase(itemType)
+	local delta = GetOverlayDelta(itemType)
+	local shadow = GetOverlayShadow(itemType)
+	local nextBase = {}
+	local changed = false
+	local seen = {}
+
+	local function visit(map)
+		for itemName in pairs(map) do
+			if not seen[itemName] then
+				seen[itemName] = true
+				local currentStringAmount = currentString[itemName] or 0
+				local currentListAmount = currentList[itemName] or 0
+				local baseEntry = base[itemName] or {}
+				local nextStringAmount = baseEntry.stringAmount or 0
+				local nextListAmount = baseEntry.listAmount or 0
+				local shadowStringAmount = shadow[itemName]
+				if shadowStringAmount == nil then
+					shadowStringAmount = nextStringAmount
+				end
+
+				if currentStringAmount ~= shadowStringAmount then
+					nextStringAmount = currentStringAmount
+				end
+				if currentListAmount ~= nextListAmount then
+					nextListAmount = currentListAmount
+				end
+
+				if nextStringAmount ~= (baseEntry.stringAmount or 0) or nextListAmount ~= (baseEntry.listAmount or 0) then
+					changed = true
+				end
+
+				if nextStringAmount > 0 or nextListAmount > 0 or (delta[itemName] or 0) ~= 0 then
+					nextBase[itemName] = {
+						stringAmount = nextStringAmount,
+						listAmount = nextListAmount,
+					}
+				end
+			end
+		end
+	end
+
+	visit(currentString)
+	visit(currentList)
+	visit(base)
+	visit(delta)
+	visit(shadow)
+
+	InventoryOverlayState.baseByType[itemType] = nextBase
+
+	return changed
+end
+
+local function SyncOverlayBaseFromProfile()
+	local changed = false
+	for itemType in pairs(InventoryOverlayTypes) do
+		if SyncOverlayBaseForType(itemType) then
+			changed = true
+		end
+	end
+	if changed then
+		ApplyOverlayForAllTypes(true)
+	end
+	return changed
+end
+
+local function GetVisibleOwnedAmount(itemType, itemName)
+	SyncOverlayBaseFromProfile()
+	local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
+	return GetVisibleAmountFromParts(baseStringAmount, baseListAmount, GetOverlayDelta(itemType)[itemName] or 0)
+end
+
+local function AdjustVisibleOwnedAmount(itemName, amountDelta, itemType, shouldFire)
+	itemType = itemType or "Weapons"
+	amountDelta = math.floor(tonumber(amountDelta) or 0)
+	if amountDelta == 0 then
+		return GetVisibleOwnedAmount(itemType, itemName)
+	end
+
+	SyncOverlayBaseFromProfile()
+
+	local delta = GetOverlayDelta(itemType)
+	local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
+	local currentVisible = GetVisibleAmountFromParts(baseStringAmount, baseListAmount, delta[itemName] or 0)
+	local nextVisible = math.max(0, currentVisible + amountDelta)
+	local targetStringAmount = math.max(0, nextVisible - baseListAmount)
+	local nextDelta = targetStringAmount - baseStringAmount
+
+	if nextDelta ~= 0 then
+		delta[itemName] = nextDelta
+	else
+		delta[itemName] = nil
+	end
+
+	ApplyOverlayForType(itemType)
+	if shouldFire ~= false then
+		FireInventoryDataChanged()
+	end
+
+	return nextVisible
+end
+
+local function SetVisibleOwnedSnapshot(itemType, targetCounts, shouldFire)
+	itemType = itemType or "Weapons"
+	SyncOverlayBaseFromProfile()
+
+	local base = GetOverlayBase(itemType)
+	local nextDelta = {}
+	local cleanTarget = CopyOwnedCounts(targetCounts)
+	local seen = {}
+
+	for itemName, targetAmount in pairs(cleanTarget) do
+		seen[itemName] = true
+		local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
+		local targetStringAmount = math.max(0, targetAmount - baseListAmount)
+		local diff = targetStringAmount - baseStringAmount
+		if diff ~= 0 then
+			nextDelta[itemName] = math.floor(diff)
+		end
+	end
+
+	for itemName in pairs(base) do
+		if not seen[itemName] then
+			local baseStringAmount = GetBaseEntryAmounts(itemType, itemName)
+			local diff = -baseStringAmount
+			if diff ~= 0 then
+				nextDelta[itemName] = diff
+			end
+		end
+	end
+
+	InventoryOverlayState.deltaByType[itemType] = nextDelta
+	ApplyOverlayForType(itemType)
+	if shouldFire ~= false then
+		FireInventoryDataChanged()
+	end
+end
+
+for itemType in pairs(InventoryOverlayTypes) do
+	InventoryOverlayState.baseByType[itemType] = BuildBaseSnapshot(itemType)
+	InventoryOverlayState.deltaByType[itemType] = {}
+	InventoryOverlayState.shadowByType[itemType] = {}
+end
+
+task.spawn(function()
+	while task.wait(0.5) do
+		pcall(SyncOverlayBaseFromProfile)
+	end
+end)
+
 local function CheckForItem(ItemName, Type)
-	local Owned = ProfileData[Type].Owned
-	for Index, Value in pairs(Owned) do
-		if Index == ItemName then return true, Value end
-		if Value == ItemName then return true, 1 end
+	local amount = GetVisibleOwnedAmount(Type, ItemName)
+	if amount > 0 then
+		return true, amount
 	end
 	return false
 end
@@ -628,40 +1007,33 @@ local function SpawnItem(ItemName, Amount, ItemType)
 	Amount = Amount or 1
 	ItemType = ItemType or "Weapons"
 	pcall(function()
-		if ProfileData[ItemType].Owned[ItemName] == nil then
-			ProfileData[ItemType].Owned[ItemName] = Amount
-		else
-			ProfileData[ItemType].Owned[ItemName] = ProfileData[ItemType].Owned[ItemName] + Amount
-		end
-		game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
+		AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
 	end)
 end
 
 local function GiveItem(ItemName, Amount, ItemType)
+	Amount = Amount or 1
+	ItemType = ItemType or "Weapons"
 	pcall(function()
-		if ProfileData[ItemType].Owned[ItemName] == nil then
-			ProfileData[ItemType].Owned[ItemName] = Amount
-		else
-			ProfileData[ItemType].Owned[ItemName] = ProfileData[ItemType].Owned[ItemName] + Amount
-		end
+		AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
 		ItemPopupService.ItemReceived:Fire(ItemName, ItemType)
-		game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
 	end)
 end
 
 local function RemoveItem(ItemName, Amount, ItemType)
+	Amount = Amount or 1
+	ItemType = ItemType or "Weapons"
 	pcall(function()
-		local owned = ProfileData[ItemType].Owned[ItemName]
+		local owned = GetVisibleOwnedAmount(ItemType, ItemName)
 		if not owned then
 			print("doesn't have the item")
 			return
 		end
-		if owned - Amount > 0 then
-			ProfileData[ItemType].Owned[ItemName] = owned - Amount
-		else
-			ProfileData[ItemType].Owned[ItemName] = nil
+		if owned <= 0 then
+			print("doesn't have the item")
+			return
 		end
-		game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
+		AdjustVisibleOwnedAmount(ItemName, -Amount, ItemType, true)
 	end)
 end
 
@@ -3803,18 +4175,8 @@ createButton(configFrame, "Save Config", function()
             makefolder("mm2run_configs")
         end
         local snapshot = {}
-        if ProfileData.Weapons and ProfileData.Weapons.Owned then
-            snapshot.Weapons = {}
-            for k, v in pairs(ProfileData.Weapons.Owned) do
-                snapshot.Weapons[k] = v
-            end
-        end
-        if ProfileData.Pets and ProfileData.Pets.Owned then
-            snapshot.Pets = {}
-            for k, v in pairs(ProfileData.Pets.Owned) do
-                snapshot.Pets[k] = v
-            end
-        end
+        snapshot.Weapons = BuildOverlayVisibleCounts("Weapons")
+        snapshot.Pets = BuildOverlayVisibleCounts("Pets")
 
         local json = game:GetService("HttpService"):JSONEncode(snapshot)
         writefile("mm2run_configs/" .. name .. ".json", json)
@@ -3825,17 +4187,9 @@ end)
 
 local clearBtn = createButton(configFrame, "Clear Inventory", function()
     pcall(function()
-        if ProfileData.Weapons and ProfileData.Weapons.Owned then
-            for k, _ in pairs(ProfileData.Weapons.Owned) do
-                ProfileData.Weapons.Owned[k] = nil
-            end
-        end
-        if ProfileData.Pets and ProfileData.Pets.Owned then
-            for k, _ in pairs(ProfileData.Pets.Owned) do
-                ProfileData.Pets.Owned[k] = nil
-            end
-        end
-        game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
+        SetVisibleOwnedSnapshot("Weapons", {}, false)
+        SetVisibleOwnedSnapshot("Pets", {}, false)
+        FireInventoryDataChanged()
         print("[mm2run/config] inventory cleared")
     end)
 end)
@@ -3959,17 +4313,9 @@ local function RefreshConfigsList()
                         local path = "mm2run_configs/" .. name .. ".json"
                         local data = game:GetService("HttpService"):JSONDecode(readfile(path))
 
-                        if data.Weapons then
-                            for k, v in pairs(data.Weapons) do
-                                ProfileData.Weapons.Owned[k] = v
-                            end
-                        end
-                        if data.Pets then
-                            for k, v in pairs(data.Pets) do
-                                ProfileData.Pets.Owned[k] = v
-                            end
-                        end
-                        game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
+                        SetVisibleOwnedSnapshot("Weapons", data.Weapons or {}, false)
+                        SetVisibleOwnedSnapshot("Pets", data.Pets or {}, false)
+                        FireInventoryDataChanged()
                         print("[mm2run/config] loaded: " .. name)
                     end)
                 end)
