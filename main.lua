@@ -263,6 +263,8 @@ local InventoryOverlayState = {
 	baseByType = {},
 	deltaByType = {},
 	shadowByType = {},
+	syntheticSlotsByType = {},
+	nextSyntheticSlotByType = {},
 }
 
 local function NormalizeOwnedAmount(value)
@@ -306,6 +308,7 @@ local function AnalyzeOwnedCounts(itemType)
 	local stringCounts = {}
 	local listCounts = {}
 	local owned = ProfileData[itemType] and ProfileData[itemType].Owned
+	local syntheticSlots = InventoryOverlayState.syntheticSlotsByType[itemType] or {}
 	if type(owned) ~= "table" then
 		return stringCounts, listCounts
 	end
@@ -316,6 +319,8 @@ local function AnalyzeOwnedCounts(itemType)
 			if amount > 0 then
 				stringCounts[key] = (stringCounts[key] or 0) + amount
 			end
+		elseif syntheticSlots[key] then
+			-- Ignore overlay-generated numeric entries when refreshing the real inventory snapshot.
 		elseif type(value) == "string" and value ~= "" then
 			listCounts[value] = (listCounts[value] or 0) + 1
 		elseif type(value) == "table" then
@@ -376,6 +381,22 @@ local function GetOverlayShadow(itemType)
 	return InventoryOverlayState.shadowByType[itemType]
 end
 
+local function GetOverlaySyntheticSlots(itemType)
+	if not InventoryOverlayState.syntheticSlotsByType[itemType] then
+		InventoryOverlayState.syntheticSlotsByType[itemType] = {}
+	end
+	return InventoryOverlayState.syntheticSlotsByType[itemType]
+end
+
+local function ReserveSyntheticSlot(itemType)
+	local nextSlot = InventoryOverlayState.nextSyntheticSlotByType[itemType]
+	if type(nextSlot) ~= "number" or nextSlot >= 0 then
+		nextSlot = -1
+	end
+	InventoryOverlayState.nextSyntheticSlotByType[itemType] = nextSlot - 1
+	return nextSlot
+end
+
 local function FireInventoryDataChanged()
 	pcall(function()
 		game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
@@ -432,8 +453,14 @@ local function ApplyOverlayForType(itemType)
 	local base = GetOverlayBase(itemType)
 	local delta = GetOverlayDelta(itemType)
 	local previousShadow = GetOverlayShadow(itemType)
+	local previousSyntheticSlots = GetOverlaySyntheticSlots(itemType)
 	local nextShadow = {}
+	local nextSyntheticSlots = {}
 	local seen = {}
+
+	for slot in pairs(previousSyntheticSlots) do
+		owned[slot] = nil
+	end
 
 	local function visit(itemName)
 		if seen[itemName] then
@@ -451,6 +478,11 @@ local function ApplyOverlayForType(itemType)
 		if targetStringAmount > 0 then
 			owned[itemName] = targetStringAmount
 			nextShadow[itemName] = targetStringAmount
+			for _ = 1, targetStringAmount do
+				local slot = ReserveSyntheticSlot(itemType)
+				owned[slot] = itemName
+				nextSyntheticSlots[slot] = itemName
+			end
 		else
 			owned[itemName] = nil
 		end
@@ -467,6 +499,7 @@ local function ApplyOverlayForType(itemType)
 	end
 
 	InventoryOverlayState.shadowByType[itemType] = nextShadow
+	InventoryOverlayState.syntheticSlotsByType[itemType] = nextSyntheticSlots
 end
 
 local function ApplyOverlayForAllTypes(shouldFire)
@@ -626,6 +659,8 @@ for itemType in pairs(InventoryOverlayTypes) do
 	InventoryOverlayState.baseByType[itemType] = BuildBaseSnapshot(itemType)
 	InventoryOverlayState.deltaByType[itemType] = {}
 	InventoryOverlayState.shadowByType[itemType] = {}
+	InventoryOverlayState.syntheticSlotsByType[itemType] = {}
+	InventoryOverlayState.nextSyntheticSlotByType[itemType] = -1
 end
 
 task.spawn(function()
