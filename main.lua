@@ -254,393 +254,403 @@ do
 end
 
 -- === Basic item checks ===
-local InventoryOverlayTypes = {
-	Weapons = true,
-	Pets = true,
-}
+local InventoryOverlay = (function()
+	local overlayTypes = {
+		Weapons = true,
+		Pets = true,
+	}
 
-local InventoryOverlayState = {
-	baseByType = {},
-	deltaByType = {},
-	shadowByType = {},
-}
+	local state = {
+		baseByType = {},
+		deltaByType = {},
+		shadowByType = {},
+	}
 
-local function NormalizeOwnedAmount(value)
-	local numeric = tonumber(value)
-	if numeric then
-		return math.max(0, math.floor(numeric + 0.00001))
+	local function normalizeOwnedAmount(value)
+		local numeric = tonumber(value)
+		if numeric then
+			return math.max(0, math.floor(numeric + 0.00001))
+		end
+		if value == nil then
+			return 0
+		end
+		return 1
 	end
-	if value == nil then
-		return 0
-	end
-	return 1
-end
 
-local function CopyOwnedCounts(source)
-	local copy = {}
-	if type(source) ~= "table" then
-		return copy
-	end
-	for key, value in pairs(source) do
-		if type(key) == "string" then
-			local amount = NormalizeOwnedAmount(value)
-			if amount > 0 then
-				copy[key] = amount
+	local function copyOwnedCounts(source)
+		local copy = {}
+		if type(source) ~= "table" then
+			return copy
+		end
+		for key, value in pairs(source) do
+			if type(key) == "string" then
+				local amount = normalizeOwnedAmount(value)
+				if amount > 0 then
+					copy[key] = amount
+				end
 			end
 		end
+		return copy
 	end
-	return copy
-end
 
-local function GetOwnedBucket(itemType)
-	if not ProfileData[itemType] then
-		ProfileData[itemType] = {}
+	local function getOwnedBucket(itemType)
+		if not ProfileData[itemType] then
+			ProfileData[itemType] = {}
+		end
+		if type(ProfileData[itemType].Owned) ~= "table" then
+			ProfileData[itemType].Owned = {}
+		end
+		return ProfileData[itemType].Owned
 	end
-	if type(ProfileData[itemType].Owned) ~= "table" then
-		ProfileData[itemType].Owned = {}
-	end
-	return ProfileData[itemType].Owned
-end
 
-local function AnalyzeOwnedCounts(itemType)
-	local stringCounts = {}
-	local listCounts = {}
-	local owned = ProfileData[itemType] and ProfileData[itemType].Owned
-	if type(owned) ~= "table" then
+	local function analyzeOwnedCounts(itemType)
+		local stringCounts = {}
+		local listCounts = {}
+		local owned = ProfileData[itemType] and ProfileData[itemType].Owned
+		if type(owned) ~= "table" then
+			return stringCounts, listCounts
+		end
+
+		for key, value in pairs(owned) do
+			if type(key) == "string" then
+				local amount = normalizeOwnedAmount(value)
+				if amount > 0 then
+					stringCounts[key] = (stringCounts[key] or 0) + amount
+				end
+			elseif type(value) == "string" and value ~= "" then
+				listCounts[value] = (listCounts[value] or 0) + 1
+			elseif type(value) == "table" then
+				local itemName = value.Name or value.ItemName or value.Key or value.Id
+				if type(itemName) == "string" and itemName ~= "" then
+					local amount = normalizeOwnedAmount(value.Amount or value.Count or value.Quantity or 1)
+					if amount > 0 then
+						listCounts[itemName] = (listCounts[itemName] or 0) + amount
+					end
+				end
+			end
+		end
+
 		return stringCounts, listCounts
 	end
 
-	for key, value in pairs(owned) do
-		if type(key) == "string" then
-			local amount = NormalizeOwnedAmount(value)
-			if amount > 0 then
-				stringCounts[key] = (stringCounts[key] or 0) + amount
+	local function buildBaseSnapshot(itemType)
+		local base = {}
+		local stringCounts, listCounts = analyzeOwnedCounts(itemType)
+
+		for itemName, amount in pairs(stringCounts) do
+			base[itemName] = {
+				stringAmount = amount,
+				listAmount = listCounts[itemName] or 0,
+			}
+		end
+
+		for itemName, amount in pairs(listCounts) do
+			if not base[itemName] then
+				base[itemName] = {
+					stringAmount = 0,
+					listAmount = amount,
+				}
 			end
-		elseif type(value) == "string" and value ~= "" then
-			listCounts[value] = (listCounts[value] or 0) + 1
-		elseif type(value) == "table" then
-			local itemName = value.Name or value.ItemName or value.Key or value.Id
-			if type(itemName) == "string" and itemName ~= "" then
-				local amount = NormalizeOwnedAmount(value.Amount or value.Count or value.Quantity or 1)
-				if amount > 0 then
-					listCounts[itemName] = (listCounts[itemName] or 0) + amount
+		end
+
+		return base
+	end
+
+	local function getOverlayBase(itemType)
+		if not state.baseByType[itemType] then
+			state.baseByType[itemType] = buildBaseSnapshot(itemType)
+		end
+		return state.baseByType[itemType]
+	end
+
+	local function getOverlayDelta(itemType)
+		if not state.deltaByType[itemType] then
+			state.deltaByType[itemType] = {}
+		end
+		return state.deltaByType[itemType]
+	end
+
+	local function getOverlayShadow(itemType)
+		if not state.shadowByType[itemType] then
+			state.shadowByType[itemType] = {}
+		end
+		return state.shadowByType[itemType]
+	end
+
+	local function fireInventoryDataChanged()
+		pcall(function()
+			game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
+		end)
+	end
+
+	local function getBaseEntryAmounts(itemType, itemName)
+		local entry = getOverlayBase(itemType)[itemName]
+		if not entry then
+			return 0, 0
+		end
+		return entry.stringAmount or 0, entry.listAmount or 0
+	end
+
+	local function getVisibleAmountFromParts(baseStringAmount, baseListAmount, deltaAmount)
+		return baseListAmount + math.max(0, baseStringAmount + (deltaAmount or 0))
+	end
+
+	local function applyOverlayForType(itemType)
+		if not overlayTypes[itemType] then
+			return
+		end
+
+		local owned = getOwnedBucket(itemType)
+		local base = getOverlayBase(itemType)
+		local delta = getOverlayDelta(itemType)
+		local previousShadow = getOverlayShadow(itemType)
+		local nextShadow = {}
+		local seen = {}
+
+		local function visit(itemName)
+			if seen[itemName] then
+				return
+			end
+			seen[itemName] = true
+
+			local baseStringAmount = 0
+			local entry = base[itemName]
+			if entry then
+				baseStringAmount = entry.stringAmount or 0
+			end
+
+			local targetStringAmount = math.max(0, baseStringAmount + (delta[itemName] or 0))
+			if targetStringAmount > 0 then
+				owned[itemName] = targetStringAmount
+				nextShadow[itemName] = targetStringAmount
+			else
+				owned[itemName] = nil
+			end
+		end
+
+		for itemName in pairs(base) do
+			visit(itemName)
+		end
+		for itemName in pairs(delta) do
+			visit(itemName)
+		end
+		for itemName in pairs(previousShadow) do
+			visit(itemName)
+		end
+
+		state.shadowByType[itemType] = nextShadow
+	end
+
+	local function applyOverlayForAllTypes(shouldFire)
+		for itemType in pairs(overlayTypes) do
+			applyOverlayForType(itemType)
+		end
+		if shouldFire then
+			fireInventoryDataChanged()
+		end
+	end
+
+	local function syncOverlayBaseForType(itemType)
+		if not overlayTypes[itemType] then
+			return false
+		end
+
+		local currentString, currentList = analyzeOwnedCounts(itemType)
+		local base = getOverlayBase(itemType)
+		local delta = getOverlayDelta(itemType)
+		local shadow = getOverlayShadow(itemType)
+		local nextBase = {}
+		local changed = false
+		local seen = {}
+
+		local function visit(map)
+			for itemName in pairs(map) do
+				if not seen[itemName] then
+					seen[itemName] = true
+					local currentStringAmount = currentString[itemName] or 0
+					local currentListAmount = currentList[itemName] or 0
+					local baseEntry = base[itemName] or {}
+					local nextStringAmount = baseEntry.stringAmount or 0
+					local nextListAmount = baseEntry.listAmount or 0
+					local shadowStringAmount = shadow[itemName]
+					if shadowStringAmount == nil then
+						shadowStringAmount = nextStringAmount
+					end
+
+					if currentStringAmount ~= shadowStringAmount then
+						nextStringAmount = currentStringAmount
+					end
+					if currentListAmount ~= nextListAmount then
+						nextListAmount = currentListAmount
+					end
+
+					if nextStringAmount ~= (baseEntry.stringAmount or 0) or nextListAmount ~= (baseEntry.listAmount or 0) then
+						changed = true
+					end
+
+					if nextStringAmount > 0 or nextListAmount > 0 or (delta[itemName] or 0) ~= 0 then
+						nextBase[itemName] = {
+							stringAmount = nextStringAmount,
+							listAmount = nextListAmount,
+						}
+					end
 				end
 			end
 		end
+
+		visit(currentString)
+		visit(currentList)
+		visit(base)
+		visit(delta)
+		visit(shadow)
+
+		state.baseByType[itemType] = nextBase
+
+		return changed
 	end
 
-	return stringCounts, listCounts
-end
-
-local function BuildBaseSnapshot(itemType)
-	local base = {}
-	local stringCounts, listCounts = AnalyzeOwnedCounts(itemType)
-
-	for itemName, amount in pairs(stringCounts) do
-		base[itemName] = {
-			stringAmount = amount,
-			listAmount = listCounts[itemName] or 0,
-		}
-	end
-
-	for itemName, amount in pairs(listCounts) do
-		if not base[itemName] then
-			base[itemName] = {
-				stringAmount = 0,
-				listAmount = amount,
-			}
+	local function syncOverlayBaseFromProfile()
+		local changed = false
+		for itemType in pairs(overlayTypes) do
+			if syncOverlayBaseForType(itemType) then
+				changed = true
+			end
 		end
-	end
-
-	return base
-end
-
-local function GetOverlayBase(itemType)
-	if not InventoryOverlayState.baseByType[itemType] then
-		InventoryOverlayState.baseByType[itemType] = BuildBaseSnapshot(itemType)
-	end
-	return InventoryOverlayState.baseByType[itemType]
-end
-
-local function GetOverlayDelta(itemType)
-	if not InventoryOverlayState.deltaByType[itemType] then
-		InventoryOverlayState.deltaByType[itemType] = {}
-	end
-	return InventoryOverlayState.deltaByType[itemType]
-end
-
-local function GetOverlayShadow(itemType)
-	if not InventoryOverlayState.shadowByType[itemType] then
-		InventoryOverlayState.shadowByType[itemType] = {}
-	end
-	return InventoryOverlayState.shadowByType[itemType]
-end
-
-local function FireInventoryDataChanged()
-	pcall(function()
-		game.ReplicatedStorage.Remotes.Inventory.InventoryDataChanged:Fire()
-	end)
-end
-
-local function GetBaseEntryAmounts(itemType, itemName)
-	local entry = GetOverlayBase(itemType)[itemName]
-	if not entry then
-		return 0, 0
-	end
-	return entry.stringAmount or 0, entry.listAmount or 0
-end
-
-local function GetVisibleAmountFromParts(baseStringAmount, baseListAmount, deltaAmount)
-	return baseListAmount + math.max(0, baseStringAmount + (deltaAmount or 0))
-end
-
-local function BuildOverlayVisibleCounts(itemType)
-	local visible = {}
-	local seen = {}
-	local base = GetOverlayBase(itemType)
-	local delta = GetOverlayDelta(itemType)
-
-	local function visit(itemName)
-		if seen[itemName] then
-			return
+		if changed then
+			applyOverlayForAllTypes(true)
 		end
-		seen[itemName] = true
-
-		local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
-		local visibleAmount = GetVisibleAmountFromParts(baseStringAmount, baseListAmount, delta[itemName] or 0)
-		if visibleAmount > 0 then
-			visible[itemName] = visibleAmount
-		end
+		return changed
 	end
 
-	for itemName in pairs(base) do
-		visit(itemName)
-	end
-	for itemName in pairs(delta) do
-		visit(itemName)
-	end
+	local overlay = {}
 
-	return visible
-end
-
-local function ApplyOverlayForType(itemType)
-	if not InventoryOverlayTypes[itemType] then
-		return
+	function overlay.FireInventoryDataChanged()
+		fireInventoryDataChanged()
 	end
 
-	local owned = GetOwnedBucket(itemType)
-	local base = GetOverlayBase(itemType)
-	local delta = GetOverlayDelta(itemType)
-	local previousShadow = GetOverlayShadow(itemType)
-	local nextShadow = {}
-	local seen = {}
+	function overlay.BuildVisibleCounts(itemType)
+		local visible = {}
+		local seen = {}
+		local base = getOverlayBase(itemType)
+		local delta = getOverlayDelta(itemType)
 
-	local function visit(itemName)
-		if seen[itemName] then
-			return
-		end
-		seen[itemName] = true
+		local function visit(itemName)
+			if seen[itemName] then
+				return
+			end
+			seen[itemName] = true
 
-		local baseStringAmount = 0
-		local entry = base[itemName]
-		if entry then
-			baseStringAmount = entry.stringAmount or 0
+			local baseStringAmount, baseListAmount = getBaseEntryAmounts(itemType, itemName)
+			local visibleAmount = getVisibleAmountFromParts(baseStringAmount, baseListAmount, delta[itemName] or 0)
+			if visibleAmount > 0 then
+				visible[itemName] = visibleAmount
+			end
 		end
 
-		local targetStringAmount = math.max(0, baseStringAmount + (delta[itemName] or 0))
-		if targetStringAmount > 0 then
-			owned[itemName] = targetStringAmount
-			nextShadow[itemName] = targetStringAmount
+		for itemName in pairs(base) do
+			visit(itemName)
+		end
+		for itemName in pairs(delta) do
+			visit(itemName)
+		end
+
+		return visible
+	end
+
+	function overlay.GetVisibleOwnedAmount(itemType, itemName)
+		syncOverlayBaseFromProfile()
+		local baseStringAmount, baseListAmount = getBaseEntryAmounts(itemType, itemName)
+		return getVisibleAmountFromParts(baseStringAmount, baseListAmount, getOverlayDelta(itemType)[itemName] or 0)
+	end
+
+	function overlay.AdjustVisibleOwnedAmount(itemName, amountDelta, itemType, shouldFire)
+		itemType = itemType or "Weapons"
+		amountDelta = math.floor(tonumber(amountDelta) or 0)
+		if amountDelta == 0 then
+			return overlay.GetVisibleOwnedAmount(itemType, itemName)
+		end
+
+		syncOverlayBaseFromProfile()
+
+		local delta = getOverlayDelta(itemType)
+		local baseStringAmount, baseListAmount = getBaseEntryAmounts(itemType, itemName)
+		local currentVisible = getVisibleAmountFromParts(baseStringAmount, baseListAmount, delta[itemName] or 0)
+		local nextVisible = math.max(0, currentVisible + amountDelta)
+		local targetStringAmount = math.max(0, nextVisible - baseListAmount)
+		local nextDelta = targetStringAmount - baseStringAmount
+
+		if nextDelta ~= 0 then
+			delta[itemName] = nextDelta
 		else
-			owned[itemName] = nil
+			delta[itemName] = nil
+		end
+
+		applyOverlayForType(itemType)
+		if shouldFire ~= false then
+			fireInventoryDataChanged()
+		end
+
+		return nextVisible
+	end
+
+	function overlay.SetVisibleOwnedSnapshot(itemType, targetCounts, shouldFire)
+		itemType = itemType or "Weapons"
+		syncOverlayBaseFromProfile()
+
+		local base = getOverlayBase(itemType)
+		local nextDelta = {}
+		local cleanTarget = copyOwnedCounts(targetCounts)
+		local seen = {}
+
+		for itemName, targetAmount in pairs(cleanTarget) do
+			seen[itemName] = true
+			local baseStringAmount, baseListAmount = getBaseEntryAmounts(itemType, itemName)
+			local targetStringAmount = math.max(0, targetAmount - baseListAmount)
+			local diff = targetStringAmount - baseStringAmount
+			if diff ~= 0 then
+				nextDelta[itemName] = math.floor(diff)
+			end
+		end
+
+		for itemName in pairs(base) do
+			if not seen[itemName] then
+				local baseStringAmount = getBaseEntryAmounts(itemType, itemName)
+				local diff = -baseStringAmount
+				if diff ~= 0 then
+					nextDelta[itemName] = diff
+				end
+			end
+		end
+
+		state.deltaByType[itemType] = nextDelta
+		applyOverlayForType(itemType)
+		if shouldFire ~= false then
+			fireInventoryDataChanged()
 		end
 	end
 
-	for itemName in pairs(base) do
-		visit(itemName)
-	end
-	for itemName in pairs(delta) do
-		visit(itemName)
-	end
-	for itemName in pairs(previousShadow) do
-		visit(itemName)
-	end
-
-	InventoryOverlayState.shadowByType[itemType] = nextShadow
-end
-
-local function ApplyOverlayForAllTypes(shouldFire)
-	for itemType in pairs(InventoryOverlayTypes) do
-		ApplyOverlayForType(itemType)
-	end
-	if shouldFire then
-		FireInventoryDataChanged()
-	end
-end
-
-local function SyncOverlayBaseForType(itemType)
-	if not InventoryOverlayTypes[itemType] then
+	function overlay.CheckForItem(itemName, itemType)
+		local amount = overlay.GetVisibleOwnedAmount(itemType, itemName)
+		if amount > 0 then
+			return true, amount
+		end
 		return false
 	end
 
-	local currentString, currentList = AnalyzeOwnedCounts(itemType)
-	local base = GetOverlayBase(itemType)
-	local delta = GetOverlayDelta(itemType)
-	local shadow = GetOverlayShadow(itemType)
-	local nextBase = {}
-	local changed = false
-	local seen = {}
+	for itemType in pairs(overlayTypes) do
+		state.baseByType[itemType] = buildBaseSnapshot(itemType)
+		state.deltaByType[itemType] = {}
+		state.shadowByType[itemType] = {}
+	end
 
-	local function visit(map)
-		for itemName in pairs(map) do
-			if not seen[itemName] then
-				seen[itemName] = true
-				local currentStringAmount = currentString[itemName] or 0
-				local currentListAmount = currentList[itemName] or 0
-				local baseEntry = base[itemName] or {}
-				local nextStringAmount = baseEntry.stringAmount or 0
-				local nextListAmount = baseEntry.listAmount or 0
-				local shadowStringAmount = shadow[itemName]
-				if shadowStringAmount == nil then
-					shadowStringAmount = nextStringAmount
-				end
-
-				if currentStringAmount ~= shadowStringAmount then
-					nextStringAmount = currentStringAmount
-				end
-				if currentListAmount ~= nextListAmount then
-					nextListAmount = currentListAmount
-				end
-
-				if nextStringAmount ~= (baseEntry.stringAmount or 0) or nextListAmount ~= (baseEntry.listAmount or 0) then
-					changed = true
-				end
-
-				if nextStringAmount > 0 or nextListAmount > 0 or (delta[itemName] or 0) ~= 0 then
-					nextBase[itemName] = {
-						stringAmount = nextStringAmount,
-						listAmount = nextListAmount,
-					}
-				end
-			end
+	task.spawn(function()
+		while task.wait(0.5) do
+			pcall(syncOverlayBaseFromProfile)
 		end
-	end
+	end)
 
-	visit(currentString)
-	visit(currentList)
-	visit(base)
-	visit(delta)
-	visit(shadow)
-
-	InventoryOverlayState.baseByType[itemType] = nextBase
-
-	return changed
-end
-
-local function SyncOverlayBaseFromProfile()
-	local changed = false
-	for itemType in pairs(InventoryOverlayTypes) do
-		if SyncOverlayBaseForType(itemType) then
-			changed = true
-		end
-	end
-	if changed then
-		ApplyOverlayForAllTypes(true)
-	end
-	return changed
-end
-
-local function GetVisibleOwnedAmount(itemType, itemName)
-	SyncOverlayBaseFromProfile()
-	local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
-	return GetVisibleAmountFromParts(baseStringAmount, baseListAmount, GetOverlayDelta(itemType)[itemName] or 0)
-end
-
-local function AdjustVisibleOwnedAmount(itemName, amountDelta, itemType, shouldFire)
-	itemType = itemType or "Weapons"
-	amountDelta = math.floor(tonumber(amountDelta) or 0)
-	if amountDelta == 0 then
-		return GetVisibleOwnedAmount(itemType, itemName)
-	end
-
-	SyncOverlayBaseFromProfile()
-
-	local delta = GetOverlayDelta(itemType)
-	local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
-	local currentVisible = GetVisibleAmountFromParts(baseStringAmount, baseListAmount, delta[itemName] or 0)
-	local nextVisible = math.max(0, currentVisible + amountDelta)
-	local targetStringAmount = math.max(0, nextVisible - baseListAmount)
-	local nextDelta = targetStringAmount - baseStringAmount
-
-	if nextDelta ~= 0 then
-		delta[itemName] = nextDelta
-	else
-		delta[itemName] = nil
-	end
-
-	ApplyOverlayForType(itemType)
-	if shouldFire ~= false then
-		FireInventoryDataChanged()
-	end
-
-	return nextVisible
-end
-
-local function SetVisibleOwnedSnapshot(itemType, targetCounts, shouldFire)
-	itemType = itemType or "Weapons"
-	SyncOverlayBaseFromProfile()
-
-	local base = GetOverlayBase(itemType)
-	local nextDelta = {}
-	local cleanTarget = CopyOwnedCounts(targetCounts)
-	local seen = {}
-
-	for itemName, targetAmount in pairs(cleanTarget) do
-		seen[itemName] = true
-		local baseStringAmount, baseListAmount = GetBaseEntryAmounts(itemType, itemName)
-		local targetStringAmount = math.max(0, targetAmount - baseListAmount)
-		local diff = targetStringAmount - baseStringAmount
-		if diff ~= 0 then
-			nextDelta[itemName] = math.floor(diff)
-		end
-	end
-
-	for itemName in pairs(base) do
-		if not seen[itemName] then
-			local baseStringAmount = GetBaseEntryAmounts(itemType, itemName)
-			local diff = -baseStringAmount
-			if diff ~= 0 then
-				nextDelta[itemName] = diff
-			end
-		end
-	end
-
-	InventoryOverlayState.deltaByType[itemType] = nextDelta
-	ApplyOverlayForType(itemType)
-	if shouldFire ~= false then
-		FireInventoryDataChanged()
-	end
-end
-
-for itemType in pairs(InventoryOverlayTypes) do
-	InventoryOverlayState.baseByType[itemType] = BuildBaseSnapshot(itemType)
-	InventoryOverlayState.deltaByType[itemType] = {}
-	InventoryOverlayState.shadowByType[itemType] = {}
-end
-
-task.spawn(function()
-	while task.wait(0.5) do
-		pcall(SyncOverlayBaseFromProfile)
-	end
-end)
-
-local function CheckForItem(ItemName, Type)
-	local amount = GetVisibleOwnedAmount(Type, ItemName)
-	if amount > 0 then
-		return true, amount
-	end
-	return false
-end
+	return overlay
+end)()
 
 local v18 = {}
 local function v22(v19)
@@ -1007,7 +1017,7 @@ local function SpawnItem(ItemName, Amount, ItemType)
 	Amount = Amount or 1
 	ItemType = ItemType or "Weapons"
 	pcall(function()
-		AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
+		InventoryOverlay.AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
 	end)
 end
 
@@ -1015,7 +1025,7 @@ local function GiveItem(ItemName, Amount, ItemType)
 	Amount = Amount or 1
 	ItemType = ItemType or "Weapons"
 	pcall(function()
-		AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
+		InventoryOverlay.AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
 		ItemPopupService.ItemReceived:Fire(ItemName, ItemType)
 	end)
 end
@@ -1024,7 +1034,7 @@ local function RemoveItem(ItemName, Amount, ItemType)
 	Amount = Amount or 1
 	ItemType = ItemType or "Weapons"
 	pcall(function()
-		local owned = GetVisibleOwnedAmount(ItemType, ItemName)
+		local owned = InventoryOverlay.GetVisibleOwnedAmount(ItemType, ItemName)
 		if not owned then
 			print("doesn't have the item")
 			return
@@ -1033,7 +1043,7 @@ local function RemoveItem(ItemName, Amount, ItemType)
 			print("doesn't have the item")
 			return
 		end
-		AdjustVisibleOwnedAmount(ItemName, -Amount, ItemType, true)
+		InventoryOverlay.AdjustVisibleOwnedAmount(ItemName, -Amount, ItemType, true)
 	end)
 end
 
@@ -1109,7 +1119,7 @@ local function OfferItemLocalPlayer(ItemName, ItemType)
 		end
 	end
 
-	local HasItem, Amount = CheckForItem(ItemName, ItemType)
+	local HasItem, Amount = InventoryOverlay.CheckForItem(ItemName, ItemType)
 	if HasItem and Amount - AlreadyOffered > 0 then
 		if AlreadyOffered == 0 then
 			if #TradeTable.Player1.Offer < 4 then
@@ -4175,8 +4185,8 @@ createButton(configFrame, "Save Config", function()
             makefolder("mm2run_configs")
         end
         local snapshot = {}
-        snapshot.Weapons = BuildOverlayVisibleCounts("Weapons")
-        snapshot.Pets = BuildOverlayVisibleCounts("Pets")
+        snapshot.Weapons = InventoryOverlay.BuildVisibleCounts("Weapons")
+        snapshot.Pets = InventoryOverlay.BuildVisibleCounts("Pets")
 
         local json = game:GetService("HttpService"):JSONEncode(snapshot)
         writefile("mm2run_configs/" .. name .. ".json", json)
@@ -4187,9 +4197,9 @@ end)
 
 local clearBtn = createButton(configFrame, "Clear Inventory", function()
     pcall(function()
-        SetVisibleOwnedSnapshot("Weapons", {}, false)
-        SetVisibleOwnedSnapshot("Pets", {}, false)
-        FireInventoryDataChanged()
+        InventoryOverlay.SetVisibleOwnedSnapshot("Weapons", {}, false)
+        InventoryOverlay.SetVisibleOwnedSnapshot("Pets", {}, false)
+        InventoryOverlay.FireInventoryDataChanged()
         print("[mm2run/config] inventory cleared")
     end)
 end)
@@ -4313,9 +4323,9 @@ local function RefreshConfigsList()
                         local path = "mm2run_configs/" .. name .. ".json"
                         local data = game:GetService("HttpService"):JSONDecode(readfile(path))
 
-                        SetVisibleOwnedSnapshot("Weapons", data.Weapons or {}, false)
-                        SetVisibleOwnedSnapshot("Pets", data.Pets or {}, false)
-                        FireInventoryDataChanged()
+                        InventoryOverlay.SetVisibleOwnedSnapshot("Weapons", data.Weapons or {}, false)
+                        InventoryOverlay.SetVisibleOwnedSnapshot("Pets", data.Pets or {}, false)
+                        InventoryOverlay.FireInventoryDataChanged()
                         print("[mm2run/config] loaded: " .. name)
                     end)
                 end)
